@@ -9,10 +9,9 @@ ArtWineGuide – Guide bot
 - Сбор имени → e-mail.
 - Запись лида в Google Sheets (Service Account JSON).
 - Паузы 2 секунды между: "Подписка подтверждена" → PDF → "Как к тебе обращаться?"
-- Команды админа: /stats, /pingpdf, /gsping, /gstest.
+- Команды админа: /whoami, /stats, /pingpdf, /gsping, /gstest.
 
 ENV (Railway → Variables или локально):
-  # Обязательные
   BOT_TOKEN=...                   # токен из @BotFather
   BOT_USERNAME=MyWineBot          # без @
   CHANNEL_ID=@lazovsky_kirill     # публичный канал
@@ -22,12 +21,12 @@ ENV (Railway → Variables или локально):
   # или
   PDF_PATH=Kak_vyibrat_horoshee_vino_v_magazine_restorane_ili_na_podarok_.pdf
 
-  # Google Sheets (опционально, если нужна запись лидов)
+  # Google Sheets (опционально)
   GOOGLE_SERVICE_ACCOUNT_JSON={...целый JSON...}
   SHEET_ID=1D7I3k6XsE68NaY3QOivqXo703jzYLq9h8wxxnfcGi2c
   SHEET_NAME=Leads
 
-  # Админ (опционально)
+  # Админ (для /whoami /stats /pingpdf /gsping /gstest)
   ADMIN_USER_ID=123456789
 """
 
@@ -350,6 +349,11 @@ async def keyword_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.setdefault("start_param_raw", None)
         await guide_flow(update, context, trigger="keyword")
 
+# ───────────────────────────── АДМИН-КОМАНДЫ ──────────────────────────────────
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Возвращает числовой Telegram ID пользователя (полезно для ADMIN_USER_ID)."""
+    await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ADMIN_USER_ID and update.effective_user.id == ADMIN_USER_ID:
         _, ws = gs_client_and_sheet()
@@ -360,7 +364,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(TEXT_STATS_DENIED)
 
-# ───────────────────────────── ДИАГНОСТИКА ────────────────────────────────────
 async def pingpdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Админ-проверка PDF: путь, наличие, размер + пробная отправка."""
     if not ADMIN_USER_ID or update.effective_user.id != ADMIN_USER_ID:
@@ -437,6 +440,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Команды
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("pingpdf", pingpdf))
