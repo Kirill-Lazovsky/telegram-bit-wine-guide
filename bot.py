@@ -58,14 +58,22 @@ TXT_SKIPPED   = "Ок, пропускаем. Спасибо!"
 TXT_GUIDES_EMPTY = "Каталог гидов скоро пополнится. Загляни чуть позже 📝"
 TXT_NO_AT     = "⚠️ Airtable не настроен. Проверь AIRTABLE_API_KEY и AIRTABLE_BASE_ID."
 TXT_ADMIN_ONLY= "Команда доступна только администратору."
+TXT_TOUR_INFO = "Функционал заявки на тур находится в разработке. Следите за обновлениями!"
 EMAIL_RE      = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 BTN_SUB="Подписаться"; BTN_CHECK="Проверить подписку"; BTN_GET="Получить гайд"; BTN_MORE="📚 Ещё гиды"; BTN_SKIP="Пропустить"
 
-# ── UI
+# ── UTILITIES
+def escape_airtable_value(value: str) -> str:
+    """Экранирует специальные символы для использования в формулах Airtable"""
+    if not value:
+        return ""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
 def deep_link(extra="guide") -> str:
     return f"https://t.me/{BOT_USERNAME}?start={extra}"
 
+# ── UI
 def kb_start() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_GET, url=deep_link("guide"))],
                                  [InlineKeyboardButton(BTN_MORE, callback_data="open_guides")]])
@@ -175,7 +183,9 @@ def lead_fields(user, display_name, email, utm, trigger, start_raw, subscribed, 
             "guide_name": guide_name, "guide_file_id": guide_file_id or "", "ref": ref or ""}
 
 def at_find_today_lead(chat_id: int) -> Optional[Dict]:
-    return (at_list_all(T_LEADS, f"AND({{chat_id}}='{chat_id}', {{date}}='{today()}')") or [None])[0]
+    safe_chat_id = escape_airtable_value(str(chat_id))
+    today_iso = today()
+    return (at_list_all(T_LEADS, f"AND({{chat_id}}='{safe_chat_id}', {{date}}='{today_iso}')") or [None])[0]
 
 def at_upsert_today_lead(user, display_name, email, utm, trigger, start_raw, subscribed, guide_name, guide_file_id, ref) -> str:
     existing=at_find_today_lead(user.id)
@@ -190,11 +200,14 @@ def at_upsert_today_lead(user, display_name, email, utm, trigger, start_raw, sub
 
 def at_record_ref(inviter: str, invited: str):
     if not inviter or inviter==invited: return
-    if at_list_all(T_REF, f"AND({{inviter_chat_id}}='{inviter}', {{invited_chat_id}}='{invited}')"): return
+    safe_inviter = escape_airtable_value(str(inviter))
+    safe_invited = escape_airtable_value(str(invited))
+    if at_list_all(T_REF, f"AND({{inviter_chat_id}}='{safe_inviter}', {{invited_chat_id}}='{safe_invited}')"): return
     at_create(T_REF, {"date": today(), "inviter_chat_id": str(inviter), "invited_chat_id": str(invited)})
 
 def last_lead(chat_id: int) -> Optional[Dict]:
-    recs=at_list_all(T_LEADS, f"{{chat_id}}='{chat_id}'")
+    safe_chat_id = escape_airtable_value(str(chat_id))
+    recs=at_list_all(T_LEADS, f"{{chat_id}}='{safe_chat_id}'")
     if not recs: return None
     recs.sort(key=lambda r: r.get("fields",{}).get("timestamp",""), reverse=True); return recs[0]
 
@@ -202,7 +215,8 @@ def guides_active() -> List[Dict]:
     return at_list_all(T_GUIDES, "{is_active}")
 
 def count_today() -> Tuple[int,int,Counter,Counter,Counter]:
-    recs=at_list_all(T_LEADS, f"{{date}}='{today()}'")
+    today_iso = today()
+    recs=at_list_all(T_LEADS, f"{{date}}='{today_iso}'")
     total=len(recs); uniq=set(); src=Counter(); camp=Counter(); refc=Counter()
     for r in recs:
         f=r.get("fields",{}); uniq.add(str(f.get("chat_id","")))
@@ -220,9 +234,11 @@ def create_report(date, d_total, d_unique, members, delta) -> Optional[str]:
     return at_create(T_REPORTS, {"date": date, "downloads_total": d_total, "unique_users": d_unique, "channel_member_count": members, "channel_delta": delta})
 
 # ── FLOW
-def kb_guides(records: List[Dict]) -> InlineKeyboardMarkup:
+def kb_guides(records: List[Dict]) -> Optional[InlineKeyboardMarkup]:
+    if not records:
+        return None
     rows=[[InlineKeyboardButton(r.get("fields",{}).get("name","Без названия"), callback_data=f"g|{r['id']}")] for r in records]
-    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("Каталог пуст", callback_data="noop")]])
+    return InlineKeyboardMarkup(rows)
 
 def utm_from_ctx(ctx): return ctx.user_data.get("utm", {})
 def start_raw(ctx): return ctx.user_data.get("start_param_raw")
@@ -236,18 +252,31 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await guide_flow(update, ctx, "start"); return
     await update.message.reply_text(TXT_WELCOME, reply_markup=kb_start())
 
+async def grant_access_and_log(user, chat_id, ctx, trigger, guide_name, guide_file_id):
+    """Общая функция для выдачи гайда и логирования"""
+    await send_pdf_robust(chat_id, ctx, guide_file_id, PDF_PATH if guide_file_id is None else None)
+    utm = utm_from_ctx(ctx)
+    ref = utm.get("ref")
+    if ref:
+        at_record_ref(ref, str(user.id))
+    rec_id = at_upsert_today_lead(user, None, None, utm, trigger, start_raw(ctx), True, guide_name, guide_file_id, ref)
+    if not rec_id:
+        await notify_error(ctx, "Airtable: failed to log lead")
+    ctx.user_data["lead_record_id"] = rec_id or None
+    ctx.user_data["awaiting_name"] = True
+    ctx.user_data["awaiting_email"] = False
+    await asyncio.sleep(2)
+    return rec_id
+
 async def guide_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE, trigger: str):
-    user=update.effective_user; chat_id=update.effective_chat.id
-    sub=await is_subscribed(user.id, ctx)
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    sub = await is_subscribed(user.id, ctx)
+    
     if sub is True:
-        await update.effective_message.reply_text(TXT_ALREADY); await asyncio.sleep(2)
-        await send_pdf_robust(chat_id, ctx, PDF_FILE_ID, PDF_PATH); await asyncio.sleep(2)
-        utm=utm_from_ctx(ctx); ref=utm.get("ref"); 
-        if ref: at_record_ref(ref, str(user.id))
-        rec_id=at_upsert_today_lead(user, None, None, utm, trigger, start_raw(ctx), True, DEFAULT_GUIDE, PDF_FILE_ID, ref)
-        if not rec_id: await notify_error(ctx, "Airtable: failed to log lead (guide_flow)")
-        ctx.user_data["lead_record_id"]=rec_id or None
-        ctx.user_data["awaiting_name"]=True; ctx.user_data["awaiting_email"]=False
+        await update.effective_message.reply_text(TXT_ALREADY)
+        await asyncio.sleep(2)
+        await grant_access_and_log(user, chat_id, ctx, trigger, DEFAULT_GUIDE, PDF_FILE_ID)
         await update.effective_message.reply_text(TXT_ASK_NAME, reply_markup=kb_skip("name"))
     elif sub is False:
         await update.effective_message.reply_text(TXT_NEEDSUB, reply_markup=kb_subscribe())
@@ -255,51 +284,83 @@ async def guide_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE, trigger: st
         await update.effective_message.reply_text(TXT_ERROR)
 
 async def open_guides(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    recs=guides_active()
-    if not recs: await q.edit_message_text(TXT_GUIDES_EMPTY); return
-    await q.edit_message_text("Выбери гайд:", reply_markup=kb_guides(recs))
+    q = update.callback_query
+    await q.answer()
+    
+    # Проверка, что callback от того же пользователя
+    if q.from_user.id != q.message.chat_id:
+        await q.answer("Эта кнопка не для вас!")
+        return
+        
+    recs = guides_active()
+    if not recs:
+        await q.edit_message_text(TXT_GUIDES_EMPTY)
+        return
+        
+    markup = kb_guides(recs)
+    if markup:
+        await q.edit_message_text("Выбери гайд:", reply_markup=markup)
+    else:
+        await q.edit_message_text(TXT_GUIDES_EMPTY)
 
 async def pick_guide(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rec_id: str):
-    q=update.callback_query; await q.answer()
-    user=q.from_user; chat_id=q.message.chat_id
-    sub=await is_subscribed(user.id, ctx)
+    q = update.callback_query
+    await q.answer()
+    
+    # Проверка, что callback от того же пользователя
+    if q.from_user.id != q.message.chat_id:
+        await q.answer("Эта кнопка не для вас!")
+        return
+        
+    user = q.from_user
+    chat_id = q.message.chat_id
+    sub = await is_subscribed(user.id, ctx)
+    
     if sub is not True:
-        await q.edit_message_text(TXT_NEEDSUB, reply_markup=kb_subscribe()); return
-    guide=at_get(T_GUIDES, rec_id)
-    if not guide: await q.edit_message_text("Этот гайд временно недоступен."); return
-    fields=guide.get("fields",{}); name=fields.get("name","Гайд"); fid=fields.get("file_id")
-    await q.edit_message_text(f"Отправляю «{name}» 📥"); await asyncio.sleep(2)
-    await send_pdf_robust(chat_id, ctx, fid, None); await asyncio.sleep(2)
-    utm=utm_from_ctx(ctx); ref=utm.get("ref"); 
-    if ref: at_record_ref(ref, str(user.id))
-    rec_id2=at_upsert_today_lead(user, None, None, utm, "guide_menu", start_raw(ctx), True, name, fid, ref)
-    if not rec_id2: await notify_error(ctx, "Airtable: failed to log lead (pick_guide)")
-    ctx.user_data["lead_record_id"]=rec_id2 or None; ctx.user_data["awaiting_name"]=True; ctx.user_data["awaiting_email"]=False
+        await q.edit_message_text(TXT_NEEDSUB, reply_markup=kb_subscribe())
+        return
+        
+    guide = at_get(T_GUIDES, rec_id)
+    if not guide:
+        await q.edit_message_text("Этот гайд временно недоступен.")
+        return
+        
+    fields = guide.get("fields", {})
+    name = fields.get("name", "Гайд")
+    fid = fields.get("file_id")
+    
+    await q.edit_message_text(f"Отправляю «{name}» 📥")
+    await grant_access_and_log(user, chat_id, ctx, "guide_menu", name, fid)
     await q.message.reply_text(TXT_ASK_NAME, reply_markup=kb_skip("name"))
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; data=q.data or ""
-    if data=="check_sub":
-        await q.answer(); user=q.from_user; chat_id=q.message.chat_id
-        sub=await is_subscribed(user.id, ctx)
+    q = update.callback_query
+    data = q.data or ""
+    
+    # Проверка, что callback от того же пользователя
+    if q.from_user.id != q.message.chat_id:
+        await q.answer("Эта кнопка не для вас!")
+        return
+        
+    if data == "check_sub":
+        await q.answer()
+        user = q.from_user
+        chat_id = q.message.chat_id
+        sub = await is_subscribed(user.id, ctx)
+        
         if sub is True:
-            await q.edit_message_text(TXT_ALREADY); await asyncio.sleep(2)
-            await send_pdf_robust(chat_id, ctx, PDF_FILE_ID, PDF_PATH); await asyncio.sleep(2)
-            utm=utm_from_ctx(ctx); ref=utm.get("ref"); 
-            if ref: at_record_ref(ref, str(user.id))
-            rec_id=at_upsert_today_lead(user, None, None, utm, "button_check", start_raw(ctx), True, DEFAULT_GUIDE, PDF_FILE_ID, ref)
-            if not rec_id: await notify_error(ctx, "Airtable: failed to log lead (check_sub)")
-            ctx.user_data["lead_record_id"]=rec_id or None; ctx.user_data["awaiting_name"]=True; ctx.user_data["awaiting_email"]=False
+            await q.edit_message_text(TXT_ALREADY)
+            await asyncio.sleep(2)
+            await grant_access_and_log(user, chat_id, ctx, "button_check", DEFAULT_GUIDE, PDF_FILE_ID)
             await q.message.reply_text(TXT_ASK_NAME, reply_markup=kb_skip("name"))
         elif sub is False:
             await q.edit_message_text(TXT_NEEDSUB, reply_markup=kb_subscribe())
         else:
             await q.edit_message_text(TXT_ERROR)
-    elif data=="open_guides":
+    elif data == "open_guides":
         await open_guides(update, ctx)
     elif data.startswith("g|"):
-        await pick_guide(update, ctx, data.split("|",1)[1])
+        await pick_guide(update, ctx, data.split("|", 1)[1])
     elif data.startswith("skip_"):
         await on_skip(update, ctx)
     else:
@@ -307,30 +368,54 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── collect name/email
 async def on_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    if q.data=="skip_name":
-        ctx.user_data["awaiting_name"]=False; ctx.user_data["awaiting_email"]=True
+    q = update.callback_query
+    await q.answer()
+    
+    # Проверка, что callback от того же пользователя
+    if q.from_user.id != q.message.chat_id:
+        await q.answer("Эта кнопка не для вас!")
+        return
+        
+    if q.data == "skip_name":
+        ctx.user_data["awaiting_name"] = False
+        ctx.user_data["awaiting_email"] = True
         await q.message.reply_text(TXT_ASK_MAIL, reply_markup=kb_skip("email"))
-    elif q.data=="skip_email":
-        ctx.user_data["awaiting_email"]=False; await q.message.reply_text(TXT_SKIPPED)
+    elif q.data == "skip_email":
+        ctx.user_data["awaiting_email"] = False
+        await q.message.reply_text(TXT_SKIPPED)
 
 async def collector(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text=(update.message.text or "").strip()
+    # Если пользователь в процессе ввода данных, но отправил команду
+    if ctx.user_data.get("awaiting_name") or ctx.user_data.get("awaiting_email"):
+        if update.message.text and update.message.text.startswith('/'):
+            await update.message.reply_text("Пожалуйста, завершите ввод данных или нажмите 'Пропустить'")
+            return
+            
+    text = (update.message.text or "").strip()
     if ctx.user_data.get("awaiting_name"):
-        ctx.user_data["display_name"]=text; ctx.user_data["awaiting_name"]=False; ctx.user_data["awaiting_email"]=True
-        rid=ctx.user_data.get("lead_record_id"); 
-        if rid: at_patch(T_LEADS, rid, {"display_name": text})
-        await update.message.reply_text(TXT_ASK_MAIL, reply_markup=kb_skip("email")); return
+        ctx.user_data["display_name"] = text
+        ctx.user_data["awaiting_name"] = False
+        ctx.user_data["awaiting_email"] = True
+        rid = ctx.user_data.get("lead_record_id")
+        if rid:
+            at_patch(T_LEADS, rid, {"display_name": text})
+        await update.message.reply_text(TXT_ASK_MAIL, reply_markup=kb_skip("email"))
+        return
     if ctx.user_data.get("awaiting_email"):
         if not EMAIL_RE.match(text):
-            await update.message.reply_text(TXT_MAIL_BAD, reply_markup=kb_skip("email")); return
-        ctx.user_data["awaiting_email"]=False; rid=ctx.user_data.get("lead_record_id"); 
-        if rid: at_patch(T_LEADS, rid, {"email": text})
-        await update.message.reply_text(TXT_MAIL_OK); return
+            await update.message.reply_text(TXT_MAIL_BAD, reply_markup=kb_skip("email"))
+            return
+        ctx.user_data["awaiting_email"] = False
+        rid = ctx.user_data.get("lead_record_id")
+        if rid:
+            at_patch(T_LEADS, rid, {"email": text})
+        await update.message.reply_text(TXT_MAIL_OK)
+        return
 
 async def keyword_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "гайд" in (update.message.text or "").lower():
-        ctx.user_data.setdefault("utm", {}); ctx.user_data.setdefault("start_param_raw", None)
+        ctx.user_data.setdefault("utm", {})
+        ctx.user_data.setdefault("start_param_raw", None)
         await guide_flow(update, ctx, "keyword")
 
 # ── user commands
@@ -338,72 +423,134 @@ async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
 
 async def resend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    lead=last_lead(update.effective_user.id)
-    if not lead: await update.message.reply_text("Пока не вижу скачиваний. Напиши «гайд» или открой каталог."); return
-    f=lead.get("fields",{}); name=f.get("guide_name") or DEFAULT_GUIDE; fid=f.get("guide_file_id") or PDF_FILE_ID
-    await update.message.reply_text(f"Повторно отправляю «{name}» 📥"); await asyncio.sleep(2)
+    lead = last_lead(update.effective_user.id)
+    if not lead:
+        await update.message.reply_text("Пока не вижу скачиваний. Напиши «гайд» или открой каталог.")
+        return
+        
+    f = lead.get("fields", {})
+    name = f.get("guide_name") or DEFAULT_GUIDE
+    fid = f.get("guide_file_id") or PDF_FILE_ID
+    
+    await update.message.reply_text(f"Повторно отправляю «{name}» 📥")
+    await asyncio.sleep(2)
     await send_pdf_robust(update.effective_chat.id, ctx, fid, PDF_PATH if fid is None else None)
 
 async def reflink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    link=deep_link(f"guide__ref={update.effective_user.id}"); await update.message.reply_text(f"Твоя персональная ссылка:\n{link}")
+    link = deep_link(f"guide__ref={update.effective_user.id}")
+    await update.message.reply_text(f"Твоя персональная ссылка:\n{link}")
+
+async def tour(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TXT_TOUR_INFO)
 
 # ── admin helpers
 def is_admin(update: Update) -> bool:
     return ADMIN_USER_ID and update.effective_user.id == ADMIN_USER_ID
 
 async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): await update.message.reply_text(TXT_ADMIN_ONLY); return
-    try: members=await ctx.bot.get_chat_member_count(CHANNEL_ID); tg_ok=True
-    except Exception: members=-1; tg_ok=False
-    at_ok=bool(at_headers())
+    if not is_admin(update):
+        await update.message.reply_text(TXT_ADMIN_ONLY)
+        return
+        
+    try:
+        members = await ctx.bot.get_chat_member_count(CHANNEL_ID)
+        tg_ok = True
+    except Exception:
+        members = -1
+        tg_ok = False
+        
+    at_ok = bool(at_headers())
     if at_ok:
-        try: _=guides_active()
-        except Exception: at_ok=False
+        try:
+            _ = guides_active()
+        except Exception:
+            at_ok = False
+            
     await update.message.reply_text(f"HEALTH:\n— Telegram: {'OK' if tg_ok else 'FAIL'} (subs={members if members>=0 else 'N/A'})\n— Airtable: {'OK' if at_ok else 'FAIL'}\n— Report chat: {REPORT_CHAT_ID}\n— TZ: {getattr(tz,'key','UTC')} @ {HOUR:02d}:{MINU:02d}")
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): await update.message.reply_text(TXT_ADMIN_ONLY); return
-    if not at_headers(): await update.message.reply_text(TXT_NO_AT); return
+    if not is_admin(update):
+        await update.message.reply_text(TXT_ADMIN_ONLY)
+        return
+        
+    if not at_headers():
+        await update.message.reply_text(TXT_NO_AT)
+        return
+        
     total, uniq, src, camp, refc = count_today()
-    try: members = await ctx.bot.get_chat_member_count(CHANNEL_ID)
-    except Exception: members=-1
-    fmt=lambda c: ", ".join([f"{k}: {v}" for k,v in c.most_common(3)]) or "—"
+    try:
+        members = await ctx.bot.get_chat_member_count(CHANNEL_ID)
+    except Exception:
+        members = -1
+        
+    fmt = lambda c: ", ".join([f"{k}: {v}" for k, v in c.most_common(3)]) or "—"
     await update.message.reply_text(f"Сегодня:\n— скачиваний: {total}\n— уникальных: {uniq}\n— подписчики канала: {members if members>=0 else 'N/A'}\n— топ источников: {fmt(src)}\n— топ кампаний: {fmt(camp)}\n— топ рефереров: {fmt(refc)}")
 
 async def report_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): await update.message.reply_text(TXT_ADMIN_ONLY); return
+    if not is_admin(update):
+        await update.message.reply_text(TXT_ADMIN_ONLY)
+        return
+        
     await do_daily_report(ctx)
 
 async def atping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): await update.message.reply_text(TXT_ADMIN_ONLY); return
-    headers_ok=bool(at_headers())
-    try: recs=guides_active(); msg=f"Airtable headers: {'OK' if headers_ok else 'MISSING'}\nGuides records: {len(recs)}"
-    except Exception as e: msg=f"Airtable error: {type(e).__name__}: {e}"
+    if not is_admin(update):
+        await update.message.reply_text(TXT_ADMIN_ONLY)
+        return
+        
+    headers_ok = bool(at_headers())
+    try:
+        recs = guides_active()
+        msg = f"Airtable headers: {'OK' if headers_ok else 'MISSING'}\nGuides records: {len(recs)}"
+    except Exception as e:
+        msg = f"Airtable error: {type(e).__name__}: {e}"
+        
     await update.message.reply_text(msg)
 
 async def pingpdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): await update.message.reply_text(TXT_ADMIN_ONLY); return
-    exists=os.path.exists(PDF_PATH); size=os.path.getsize(PDF_PATH) if exists else 0
-    info=f"PDF_FILE_ID={'set' if PDF_FILE_ID else 'not set'}\nPDF_PATH={os.path.basename(PDF_PATH)}\nexists={exists}\nsize={size} bytes"
-    try: await send_pdf_robust(update.effective_chat.id, ctx, PDF_FILE_ID, PDF_PATH)
-    except Exception as e: info += f"\nОшибка отправки: {e}"
+    if not is_admin(update):
+        await update.message.reply_text(TXT_ADMIN_ONLY)
+        return
+        
+    exists = os.path.exists(PDF_PATH)
+    size = os.path.getsize(PDF_PATH) if exists else 0
+    info = f"PDF_FILE_ID={'set' if PDF_FILE_ID else 'not set'}\nPDF_PATH={os.path.basename(PDF_PATH)}\nexists={exists}\nsize={size} bytes"
+    
+    try:
+        await send_pdf_robust(update.effective_chat.id, ctx, PDF_FILE_ID, PDF_PATH)
+    except Exception as e:
+        info += f"\nОшибка отправки: {e}"
+        
     await update.message.reply_text(info)
 
 # ── report
 async def do_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
-    if not at_headers(): log.warning("Airtable not configured"); return
+    if not at_headers():
+        log.warning("Airtable not configured")
+        return
+        
     total, uniq, src, camp, refc = count_today()
-    try: members = await ctx.bot.get_chat_member_count(CHANNEL_ID)
-    except Exception as e: log.exception("get_chat_member_count failed: %s", e); members=-1
-    lr=last_report(); last_cnt=int(lr.get("fields",{}).get("channel_member_count",0)) if lr else 0
-    delta=(members-last_cnt) if members>=0 else 0
+    try:
+        members = await ctx.bot.get_chat_member_count(CHANNEL_ID)
+    except Exception as e:
+        log.exception("get_chat_member_count failed: %s", e)
+        members = -1
+        
+    lr = last_report()
+    last_cnt = int(lr.get("fields", {}).get("channel_member_count", 0)) if lr else 0
+    delta = (members - last_cnt) if members >= 0 else 0
+    
     create_report(today(), total, uniq, members, delta)
-    fmt=lambda c: ", ".join([f"{k}: {v}" for k,v in c.most_common(3)]) or "—"
-    text=(f"📊 Отчёт за {today()}:\n— Скачиваний: <b>{total}</b>\n— Уникальных: <b>{uniq}</b>\n"
-          f"— Подписчики канала: <b>{members if members>=0 else 'N/A'}</b>{'' if members<0 else f' (Δ {delta:+d})'}\n"
-          f"— Топ источников: <b>{fmt(src)}</b>\n— Топ кампаний: <b>{fmt(camp)}</b>\n— Топ рефереров: <b>{fmt(refc)}</b>")
-    try: await ctx.bot.send_message(REPORT_CHAT_ID, text, parse_mode="HTML")
-    except Exception as e: log.exception("send report failed: %s", e)
+    
+    fmt = lambda c: ", ".join([f"{k}: {v}" for k, v in c.most_common(3)]) or "—"
+    text = (f"📊 Отчёт за {today()}:\n— Скачиваний: <b>{total}</b>\n— Уникальных: <b>{uniq}</b>\n"
+            f"— Подписчики канала: <b>{members if members>=0 else 'N/A'}</b>{'' if members<0 else f' (Δ {delta:+d})'}\n"
+            f"— Топ источников: <b>{fmt(src)}</b>\n— Топ кампаний: <b>{fmt(camp)}</b>\n— Топ рефереров: <b>{fmt(refc)}</b>")
+            
+    try:
+        await ctx.bot.send_message(REPORT_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        log.exception("send report failed: %s", e)
 
 # ── unknown command (диагностика опечаток)
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -412,27 +559,31 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── errors
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception", exc_info=ctx.error)
-    try: await notify_error(ctx, f"{type(ctx.error).__name__}: {ctx.error}")
-    except Exception: pass
+    try:
+        await notify_error(ctx, f"{type(ctx.error).__name__}: {ctx.error}")
+    except Exception:
+        pass
 
 # ── post_init: выставляем список команд корректно
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start","Начать"),
-        BotCommand("whoami","Показать мой Telegram ID"),
-        BotCommand("resend","Прислать последний гайд"),
-        BotCommand("reflink","Персональная реф-ссылка"),
-        BotCommand("tour","Заявка на тур"),
-        BotCommand("health","(админ) Статус"),
-        BotCommand("stats","(админ) Статистика"),
-        BotCommand("report_now","(админ) Отчёт сейчас"),
-        BotCommand("atping","(админ) Ping Airtable"),
-        BotCommand("pingpdf","(админ) Ping PDF"),
+        BotCommand("start", "Начать"),
+        BotCommand("whoami", "Показать мой Telegram ID"),
+        BotCommand("resend", "Прислать последний гайд"),
+        BotCommand("reflink", "Персональная реф-ссылка"),
+        BotCommand("tour", "Заявка на тур"),
+        BotCommand("health", "(админ) Статус"),
+        BotCommand("stats", "(админ) Статистика"),
+        BotCommand("report_now", "(админ) Отчёт сейчас"),
+        BotCommand("atping", "(админ) Ping Airtable"),
+        BotCommand("pingpdf", "(админ) Ping PDF"),
     ])
 
 # ── MAIN
 def main():
-    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN не задан")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан")
+        
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # команды
@@ -440,7 +591,7 @@ def main():
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("resend", resend))
     app.add_handler(CommandHandler("reflink", reflink))
-    app.add_handler(CommandHandler("tour", lambda u,c: c.application.create_task(start(u,c))))  # заглушка, чтобы не падало
+    app.add_handler(CommandHandler("tour", tour))
 
     # админ
     app.add_handler(CommandHandler("health", health))
